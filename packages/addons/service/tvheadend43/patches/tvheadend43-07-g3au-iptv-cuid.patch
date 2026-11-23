@@ -1,0 +1,319 @@
+diff --git a/src/input/mpegts/iptv/iptv_auto.c b/src/input/mpegts/iptv/iptv_auto.c
+index 617df6b2..a17838b1 100644
+--- a/src/input/mpegts/iptv/iptv_auto.c
++++ b/src/input/mpegts/iptv/iptv_auto.c
+@@ -21,6 +21,7 @@
+ #include "http.h"
+ #include "iptv_private.h"
+ #include "channels.h"
++#include "htsp_server.h"
+ #include "download.h"
+ #include "epggrab.h"
+ #include "misc/m3u.h"
+@@ -67,6 +68,158 @@ static int _epgcfg_from_str(const char *str, char *manual, size_t manual_len)
+ /*
+  *
+  */
++/*
++ * G3-AL laboratory candidate: snapshot effective names before changing the
++ * IPTV mux name; notify only auto-named channels whose effective name changed.
++ */
++typedef struct iptv_auto_channel_snapshot {
++  channel_t *channel;
++  char *old_name;
++} iptv_auto_channel_snapshot_t;
++
++static void
++iptv_auto_channel_snapshots_free(iptv_auto_channel_snapshot_t *items, size_t count)
++{
++  size_t i;
++  for (i = 0; i < count; i++)
++    free(items[i].old_name);
++  free(items);
++}
++
++static int
++iptv_auto_channel_snapshots_take(mpegts_mux_t *mm,
++                                 iptv_auto_channel_snapshot_t **items,
++                                 size_t *count)
++{
++  mpegts_service_t *ms;
++  idnode_list_mapping_t *ilm;
++  iptv_auto_channel_snapshot_t *new_items;
++  channel_t *ch;
++  const char *name;
++  size_t i;
++
++  LIST_FOREACH(ms, &mm->mm_services, s_dvb_mux_link) {
++    LIST_FOREACH(ilm, &ms->s_channels, ilm_in1_link) {
++      ch = (channel_t *)ilm->ilm_in2;
++      if (!ch->ch_autoname || (ch->ch_name && *ch->ch_name))
++        continue;
++      for (i = 0; i < *count; i++)
++        if ((*items)[i].channel == ch)
++          break;
++      if (i < *count)
++        continue;
++
++      new_items = realloc(*items, (*count + 1) * sizeof(**items));
++      if (!new_items)
++        return -1;
++      *items = new_items;
++      (*items)[*count].channel = ch;
++      (*items)[*count].old_name = NULL;
++      (*count)++;
++      name = channel_get_name(ch, NULL);
++      (*items)[*count - 1].old_name = strdup(name ?: "");
++      if (!(*items)[*count - 1].old_name)
++        return -1;
++    }
++  }
++  return 0;
++}
++
++
++/*
++ * G3-AN candidate, synthetic HTTP playlist laboratory only:
++ * Preflight CUID uniqueness and active-mux URL changes BEFORE mutating any mux.
++ * No name-based adoption, no silent duplicate CUID or ambiguous URL mapping.
++ */
++static int
++g3an_valid_cuid(const char *s)
++{
++  size_t n;
++  if (s == NULL || !*s) return 0;
++  for (n = 0; s[n]; n++) {
++    if (n >= 128 ||
++        !((s[n] >= 'a' && s[n] <= 'z') ||
++          (s[n] >= 'A' && s[n] <= 'Z') ||
++          (s[n] >= '0' && s[n] <= '9') ||
++          s[n] == '-' || s[n] == '_' || s[n] == '.'))
++      return 0;
++  }
++  return 1;
++}
++
++static int
++g3an_preflight(iptv_network_t *in, htsmsg_t *items)
++{
++  htsmsg_field_t *f, *g;
++  htsmsg_t *item, *other;
++  const char *cuid, *other_cuid, *url;
++  mpegts_mux_t *mm;
++  iptv_mux_t *im;
++  int matches, legacy;
++  HTSMSG_FOREACH(f, items) {
++    item = htsmsg_field_get_map(f);
++    if (!item) continue;
++    cuid = htsmsg_get_str(item, "CUID");
++    if (cuid) {
++      if (!g3an_valid_cuid(cuid)) {
++        tvherror(LS_IPTV, "G3-AN invalid CUID in playlist");
++        return -1;
++      }
++      HTSMSG_FOREACH(g, items) {
++        if (g == f) break;
++        other = htsmsg_field_get_map(g);
++        if (!other) continue;
++        other_cuid = htsmsg_get_str(other, "CUID");
++        if (other_cuid && strcmp(cuid, other_cuid) == 0) {
++          tvherror(LS_IPTV, "G3-AN duplicate CUID, refusing playlist");
++          return -1;
++        }
++        if (other_cuid &&
++            (url = htsmsg_get_str(item, "m3u-url")) &&
++            strcmp(url, htsmsg_get_str(other, "m3u-url") ?: "") == 0) {
++          tvherror(LS_IPTV, "G3-AN duplicated URL with distinct CUID");
++          return -1;
++        }
++      }
++      matches = 0;
++      legacy = 0;
++      LIST_FOREACH(mm, &in->mn_muxes, mm_network_link) {
++        im = (iptv_mux_t *)mm;
++        if (im->mm_iptv_cuid && strcmp(im->mm_iptv_cuid, cuid) == 0)
++          matches++;
++        else if (im->mm_iptv_cuid &&
++                 (url = htsmsg_get_str(item, "m3u-url")) &&
++                 strcmp(im->mm_iptv_url_sane ?: (im->mm_iptv_url ?: ""), url) == 0) {
++          tvherror(LS_IPTV, "G3-AN existing URL belongs to another CUID");
++          return -1;
++        } else if (!im->mm_iptv_cuid &&
++                   (url = htsmsg_get_str(item, "m3u-url")) &&
++                   strcmp(im->mm_iptv_url_sane ?: (im->mm_iptv_url ?: ""), url) == 0)
++          legacy++;
++      }
++      if (matches > 1 || (!matches && legacy > 1)) {
++        tvherror(LS_IPTV, "G3-AN ambiguous existing CUID/URL mapping");
++        return -1;
++      }
++      /* G3-AO: do not reject a URL config refresh solely because a mux
++       * is active. IPTV input snapshots the running stream URL separately
++       * in mm_iptv_url_raw at start; do not force-stop that input. */
++    } else {
++      /* Losing a previously assigned CUID must not silently recreate a mux. */
++      url = htsmsg_get_str(item, "m3u-url");
++      if (url) LIST_FOREACH(mm, &in->mn_muxes, mm_network_link) {
++        im = (iptv_mux_t *)mm;
++        if (im->mm_iptv_cuid &&
++            strcmp(im->mm_iptv_url_sane ?: (im->mm_iptv_url ?: ""), url) == 0) {
++          tvherror(LS_IPTV, "G3-AN missing CUID for established mux");
++          return -1;
++        }
++      }
++    }
++  }
++  return 0;
++}
++
+ static void
+ iptv_auto_network_process_m3u_item(iptv_network_t *in,
+                                    const char *last_url,
+@@ -81,16 +234,21 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
+   mpegts_mux_t *mm;
+   iptv_mux_t *im;
+   url_t u, u2;
+-  int change, epgcfg, muxprio, smuxprio;
++  int change, epgcfg, muxprio, smuxprio, name_changed, can_notify;
++  iptv_auto_channel_snapshot_t *name_snapshots = NULL;
++  size_t name_snapshots_count = 0;
++  size_t k;
+   http_arg_list_t args;
+   http_arg_t *ra1, *ra2, *ra2_next;
+   size_t l;
+   int64_t chnum2, vlcprog;
+-  const char *url, *url2, *name, *logo, *epgid, *tags;
++  const char *url, *url2, *name, *logo, *epgid, *tags, *cuid;
++  iptv_mux_t *by_cuid = NULL;
+   char *s;
+   char custom[512], name2[128], buf[32], *moduleid, *n;
+ 
+   url = htsmsg_get_str(item, "m3u-url");
++  cuid = htsmsg_get_str(item, "CUID");
+ 
+   if (url == NULL ||
+       (strncmp(url, "file://", 7) &&
+@@ -220,12 +378,47 @@ skip_url:
+     n = (char *)name;
+   }
+ 
++  /* CUID takes precedence. URL matching only adopts a legacy mux with
++   * no CUID, never a mux already belonging to another stable identity. */
++  if (cuid) {
++    LIST_FOREACH(mm, &in->mn_muxes, mm_network_link) {
++      im = (iptv_mux_t *)mm;
++      if (im->mm_iptv_cuid && strcmp(im->mm_iptv_cuid, cuid) == 0) {
++        by_cuid = im;
++        break;
++      }
++    }
++  }
+   LIST_FOREACH(mm, &in->mn_muxes, mm_network_link) {
+     im = (iptv_mux_t *)mm;
+-    if (strcmp(im->mm_iptv_url_cmpid ?: (im->mm_iptv_url ?: ""), url2) == 0) {
++    if ((by_cuid && im == by_cuid) ||
++        (!by_cuid && !im->mm_iptv_cuid &&
++         strcmp(im->mm_iptv_url_cmpid ?: (im->mm_iptv_url ?: ""), url2) == 0)) {
++      if (cuid && !im->mm_iptv_cuid) {
++        im->mm_iptv_cuid = strdup(cuid);
++        idnode_changed(&im->mm_id);
++      }
++      if (by_cuid && strcmp(im->mm_iptv_url_cmpid ?: "", url2) != 0) {
++        /* G3-AO: update config URL; current stream uses its own URL snapshot.
++         * Next mux start will use the newly configured URL. */
++        iptv_url_set(&im->mm_iptv_url, &im->mm_iptv_url_sane,
++                     url, 1, 1);
++        free(im->mm_iptv_url_cmpid);
++        im->mm_iptv_url_cmpid = strdup(url2);
++        idnode_changed(&im->mm_id);
++      }
+       im->im_delete_flag = 0;
+       change = 0;
+-      if (strcmp(im->mm_iptv_svcname ?: "", name)) {
++      name_changed = strcmp(im->mm_iptv_svcname ?: "", name) != 0;
++      /* The HTTP download callback holds global_lock; file/pipe not audited. */
++      can_notify = name_changed &&
++                   (!strncmp(in->in_url ?: "", "http://", 7) ||
++                    !strncmp(in->in_url ?: "", "https://", 8));
++      if (can_notify &&
++          iptv_auto_channel_snapshots_take(mm, &name_snapshots,
++                                           &name_snapshots_count))
++        can_notify = 0;
++      if (name_changed) {
+         free(im->mm_iptv_svcname);
+         im->mm_iptv_svcname = strdup(name);
+         change = 1;
+@@ -279,6 +472,16 @@ skip_url:
+       }
+       if (change)
+         idnode_notify_changed(&im->mm_id);
++      if (can_notify) {
++        for (k = 0; k < name_snapshots_count; k++) {
++          channel_t *ch = name_snapshots[k].channel;
++          const char *new_name = channel_get_name(ch, NULL);
++          if (strcmp(name_snapshots[k].old_name, new_name ?: ""))
++            htsp_channel_update(ch);
++        }
++      }
++      iptv_auto_channel_snapshots_free(name_snapshots,
++                                       name_snapshots_count);
+       (*total)++;
+       goto end;
+     }
+@@ -288,6 +491,7 @@ skip_url:
+   conf = htsmsg_create_map();
+   htsmsg_add_str(conf, "iptv_url", url);
+   htsmsg_add_str(conf, "iptv_url_cmpid", url2);
++  if (cuid) htsmsg_add_str(conf, "iptv_cuid", cuid);
+   if (n)
+     htsmsg_add_str(conf, "iptv_muxname", n);
+   if (name)
+@@ -356,6 +560,10 @@ iptv_auto_network_process_m3u(iptv_network_t *in, char *data,
+ 
+   m = parse_m3u(data, in->in_ctx_charset, host_url);
+   items = htsmsg_get_list(m, "items");
++  if (items && g3an_preflight(in, items)) {
++    htsmsg_destroy(m);
++    return -1;
++  }
+   if (items) {
+     HTSMSG_FOREACH(f, items) {
+       if ((item = htsmsg_field_get_map(f)) == NULL) continue;
+diff --git a/src/input/mpegts/iptv/iptv_mux.c b/src/input/mpegts/iptv/iptv_mux.c
+index 1c34cb30..32821c6a 100644
+--- a/src/input/mpegts/iptv/iptv_mux.c
++++ b/src/input/mpegts/iptv/iptv_mux.c
+@@ -157,6 +157,13 @@ const idclass_t iptv_mux_class =
+       .off      = offsetof(iptv_mux_t, mm_iptv_url_cmpid),
+       .opts     = PO_MULTILINE | PO_HIDDEN | PO_NOUI,
+     },
++    {
++      .type     = PT_STR,
++      .id       = "iptv_cuid",
++      .name     = N_("Stable playlist channel identity"),
++      .off      = offsetof(iptv_mux_t, mm_iptv_cuid),
++      .opts     = PO_HIDDEN | PO_NOUI,
++    },
+     {
+       .type     = PT_BOOL,
+       .id       = "iptv_substitute",
+@@ -331,6 +338,7 @@ iptv_mux_free ( mpegts_mux_t *mm )
+   free(im->mm_iptv_url_sane);
+   free(im->mm_iptv_url_raw);
+   free(im->mm_iptv_url_cmpid);
++  free(im->mm_iptv_cuid);
+   free(im->mm_iptv_ret_url);
+   free(im->mm_iptv_ret_url_sane);
+   free(im->mm_iptv_ret_url_raw);
+diff --git a/src/input/mpegts/iptv/iptv_private.h b/src/input/mpegts/iptv/iptv_private.h
+index dbf49c2a..1c86c09f 100644
+--- a/src/input/mpegts/iptv/iptv_private.h
++++ b/src/input/mpegts/iptv/iptv_private.h
+@@ -143,6 +143,7 @@ struct iptv_mux
+   char                 *mm_iptv_url_sane;
+   char                 *mm_iptv_url_raw;
+   char                 *mm_iptv_url_cmpid;
++  char                 *mm_iptv_cuid; /* stable per-network playlist key, optional */
+   char                 *mm_iptv_ret_url;
+   char                 *mm_iptv_ret_url_sane;
+   char                 *mm_iptv_ret_url_raw;

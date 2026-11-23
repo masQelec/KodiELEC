@@ -1,0 +1,11 @@
+--- a/src/transcoding/codec/internals.h
++++ b/src/transcoding/codec/internals.h
+@@ -256,7 +256,7 @@
+ tvh_codecs_forget(void);
+ 
+ /* ffmpeg constants */
+-#if LIBAVCODEC_VERSION_MAJOR > 59
++#if LIBAVCODEC_VERSION_MAJOR > 60
+ // **** AUDIO ****
+ // aac
+ #define FF_AV_PROFILE_AAC_MAIN                  AV_PROFILE_AAC_MAIN

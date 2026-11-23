@@ -1,0 +1,79 @@
+diff --git a/src/epggrab/module/xmltv.c b/src/epggrab/module/xmltv.c
+index 23043356..1c463395 100644
+--- a/src/epggrab/module/xmltv.c
++++ b/src/epggrab/module/xmltv.c
+@@ -562,6 +562,59 @@ static int _xmltv_parse_age_rating
+  * for 'extra information' is enabled, the text 'Cricket' will be added to
+  * the 'category' list.
+  */
++
++/* G3AV: XMLTV Spanish category aliases to DVB content codes.
++ * Unknown categories retain the original Tvheadend fallback.
++ */
++static uint8_t
++_xmltv_category_genre_es(const char *name)
++{
++  static const struct {
++    const char *name;
++    uint8_t code;
++  } aliases[] = {
++    { "Documentales", 0x23 },
++    { "Documental", 0x23 },
++    { "Deportes", 0x40 },
++    { "Programa Deportivo", 0x42 },
++    { "Fútbol", 0x43 },
++    { "Tenis", 0x44 },
++    { "Deportes Acuáticos", 0x48 },
++    { "Infantil", 0x50 },
++    { "Entretenimiento", 0x30 },
++    { "Concursos", 0x31 },
++    { "Variedades", 0x32 },
++    { "Cine", 0x10 },
++    { "Comedia", 0x14 },
++    { "Policiacas", 0x11 },
++    { "Telenovela", 0x15 },
++    { "Animación", 0x55 },
++    { "Terror", 0x13 },
++    { "Ciencia ficción", 0x13 },
++    { "Ciencia Ficción", 0x13 },
++    { "Romance", 0x16 },
++    { "Información", 0x20 },
++    { "Actualidad", 0x20 },
++    { "Ocio y Aficiones", 0xA0 },
++    { "Música", 0x60 },
++    { "Videoclips", 0x60 },
++    { "Cocina", 0xA5 },
++    { "Naturaleza y animales", 0x91 },
++    { "Ciencia y tecnología", 0x92 },
++    { "Viajes", 0xA1 },
++  };
++  size_t i;
++
++  if (!name)
++    return 0;
++
++  for (i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++)
++    if (!strcmp(name, aliases[i].name))
++      return aliases[i].code;
++
++  return 0;
++}
++
+ static epg_genre_list_t
+ *_xmltv_parse_categories ( htsmsg_t *tags )
+ {
+@@ -620,7 +673,13 @@ static epg_genre_list_t
+       if(!cat_flag)
+       {
+         if (!egl) egl = calloc(1, sizeof(epg_genre_list_t));
+-        epg_genre_list_add_by_str(egl, cat_name, NULL);
++        {
++          uint8_t genre_code = _xmltv_category_genre_es(cat_name);
++          if (genre_code)
++            epg_genre_list_add_by_eit(egl, genre_code);
++          else
++            epg_genre_list_add_by_str(egl, cat_name, NULL);
++        }
+       }
+     }
+   }
