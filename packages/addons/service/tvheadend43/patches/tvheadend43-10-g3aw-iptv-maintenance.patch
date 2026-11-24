@@ -1,0 +1,773 @@
+diff --git a/src/channels.c b/src/channels.c
+index 4bc422a..8f5dceb 100644
+--- a/src/channels.c
++++ b/src/channels.c
+@@ -1575,6 +1575,42 @@ channel_tag_unmap(channel_t *ch, void *origin)
+   }
+ }
+ 
++/*
++ * G3AW-R2C12: remove precisely one channel/tag association.
++ *
++ * The caller must perform ownership and dependency checks before
++ * invoking this function. No global Channel Tag object is deleted.
++ */
++int
++channel_tag_unmap_exact(channel_tag_t *ct, channel_t *ch)
++{
++  idnode_list_mapping_t *ilm;
++
++  if (!ct || !ch)
++    return 0;
++
++  LIST_FOREACH(ilm, &ch->ch_ctms, ilm_in2_link) {
++    if (ilm->ilm_in1 != &ct->ct_id ||
++        ilm->ilm_in2 != &ch->ch_id)
++      continue;
++
++    /*
++     * The Channel Tag is endpoint 1. Passing its idnode as origin
++     * schedules persistence of endpoint 2 (the channel).
++     */
++    idnode_list_unlink(ilm, &ct->ct_id);
++
++    if (ct->ct_enabled && !ct->ct_internal) {
++      htsp_channel_update(ch);
++      htsp_tag_update(ct);
++    }
++
++    return 1;
++  }
++
++  return 0;
++}
++
+ /**
+  *
+  */
+diff --git a/src/channels.h b/src/channels.h
+index 7b37748..1a0badf 100644
+--- a/src/channels.h
++++ b/src/channels.h
+@@ -178,6 +178,7 @@ void channel_event_updated(epg_broadcast_t *e);
+ 
+ int channel_tag_map(channel_tag_t *ct, channel_t *ch, void *origin);
+ void channel_tag_unmap(channel_t *ch, void *origin);
++int channel_tag_unmap_exact(channel_tag_t *ct, channel_t *ch);
+ 
+ int channel_tag_access(channel_tag_t *ct, struct access *a, int disabled);
+ 
+diff --git a/src/input/mpegts/iptv/iptv_auto.c b/src/input/mpegts/iptv/iptv_auto.c
+index a17838b..572e308 100644
+--- a/src/input/mpegts/iptv/iptv_auto.c
++++ b/src/input/mpegts/iptv/iptv_auto.c
+@@ -131,6 +131,575 @@ iptv_auto_channel_snapshots_take(mpegts_mux_t *mm,
+  * Preflight CUID uniqueness and active-mux URL changes BEFORE mutating any mux.
+  * No name-based adoption, no silent duplicate CUID or ambiguous URL mapping.
+  */
++/*
++ * G3AW-R2B: add M3U groups to already mapped IPTV channels.
++ *
++ * ADD ONLY. Existing associations have no provenance metadata,
++ * so removing them here would risk deleting manual assignments.
++ *
++ * Called only by the HTTP/HTTPS auto-network download callback
++ * while global_lock is held.
++ */
++/*
++ * G3AW-R2C5: remember only channel/tag links created by this
++ * IPTV reconciler. No historical association is adopted.
++ *
++ * Persisted format (per mux):
++ *   v1\n
++ *   32-hex-channel-uuid:32-hex-tag-uuid\n
++ *
++ * This is a write-only ledger at this stage. No removals.
++ */
++/* G3AW-R2C22: complete ledger validation for writer. */
++static int g3aw_managed_link_lookup(
++  iptv_mux_t *im, channel_t *ch, channel_tag_t *ct);
++
++static int
++g3aw_record_managed_tag_link(iptv_mux_t *im,
++                             channel_t *ch, channel_tag_t *ct)
++{
++  char channel_uuid[UUID_HEX_SIZE];
++  char tag_uuid[UUID_HEX_SIZE];
++  char entry[2 * UUID_HEX_SIZE + 4];
++  const char *old = im->mm_iptv_managed_tag_links;
++  const char *p;
++  char *updated;
++  size_t old_len, entry_len, header_len;
++  int n;
++  int ownership_state;
++
++
++  /*
++   * G3AW-R2C22:
++   * Validate the complete ownership ledger before any append.
++   * A corrupt or globally duplicated ledger must never be extended.
++   */
++  ownership_state = g3aw_managed_link_lookup(im, ch, ct);
++
++  if (ownership_state < 0)
++    return -1;
++
++  if (ownership_state == 1)
++    return 0;
++
++  idnode_uuid_as_str(&ch->ch_id, channel_uuid);
++  idnode_uuid_as_str(&ct->ct_id, tag_uuid);
++
++  n = snprintf(entry, sizeof(entry), "%s:%s\n",
++               channel_uuid, tag_uuid);
++  if (n < 0 || (size_t)n >= sizeof(entry))
++    return -1;
++
++  entry_len = (size_t)n;
++  header_len = old && *old ? 0 : 3;
++  old_len = old && *old ? strlen(old) : 0;
++
++  /* Do not extend unknown or malformed ledger versions. */
++  if (old_len) {
++    if (old_len < 3 || strncmp(old, "v1\n", 3))
++      return -1;
++
++    p = old + 3;
++    while (*p) {
++      size_t i;
++
++      /* An entry must contain 65 characters plus newline.
++       * Reject truncated records before indexed access. */
++      if (strnlen(p, 66) != 66)
++        return -1;
++
++      for (i = 0; i < 32; i++)
++        if (!((p[i] >= '0' && p[i] <= '9') ||
++              (p[i] >= 'a' && p[i] <= 'f')))
++          return -1;
++      if (p[32] != ':')
++        return -1;
++      for (i = 33; i < 65; i++)
++        if (!((p[i] >= '0' && p[i] <= '9') ||
++              (p[i] >= 'a' && p[i] <= 'f')))
++          return -1;
++      if (p[65] != '\n')
++        return -1;
++      if (!strncmp(p, entry, entry_len))
++        return 0;
++      p += 66;
++    }
++  }
++
++  if (old_len > 1048576 ||
++      entry_len > 1048576 - old_len - header_len)
++    return -1;
++
++  updated = malloc(old_len + header_len + entry_len + 1);
++  if (!updated)
++    return -1;
++
++  if (old_len)
++    memcpy(updated, old, old_len);
++  else
++    memcpy(updated, "v1\n", 3);
++
++  memcpy(updated + old_len + header_len, entry, entry_len);
++  updated[old_len + header_len + entry_len] = '\0';
++
++  im->mm_iptv_managed_tag_links = updated;
++  free((char *)old);
++
++  idnode_changed(&im->mm_id);
++  return 1;
++}
++
++
++/*
++ * G3AW-R2C16: read-only dependency evaluation.
++ *
++ * IMPORTANT:
++ * OBSOLETE_CANDIDATE does not authorize unlinking.
++ * The ownership ledger does not detect manual user overrides.
++ *
++ * Caller must hold the global lock.
++ */
++typedef enum {
++  G3AW_TAG_DEPENDENCY_BLOCKED = -1,
++  G3AW_TAG_DEPENDENCY_OBSOLETE_CANDIDATE = 0,
++  G3AW_TAG_DEPENDENCY_REQUIRED = 1
++} g3aw_tag_dependency_result_t;
++
++static g3aw_tag_dependency_result_t __attribute__((unused))
++g3aw_evaluate_channel_tag_dependency(
++  iptv_mux_t *owner, channel_t *ch, channel_tag_t *ct)
++{
++  idnode_list_mapping_t *ilm;
++  service_t *s;
++  mpegts_service_t *ms;
++  htsmsg_t *tags;
++  htsmsg_field_t *field;
++  const char *name;
++  int services_seen = 0;
++  int owner_service_seen = 0;
++  int required = 0;
++  int blocked = 0;
++
++  lock_assert(&global_lock);
++
++  if (!owner || !ch || !ct)
++    return G3AW_TAG_DEPENDENCY_BLOCKED;
++
++  LIST_FOREACH(ilm, &ch->ch_services, ilm_in2_link) {
++    if (ilm->ilm_in2 != &ch->ch_id || !ilm->ilm_in1) {
++      blocked = 1;
++      continue;
++    }
++
++    s = (service_t *)ilm->ilm_in1;
++    services_seen++;
++
++    /*
++     * A service whose mux/type cannot be established blocks removal.
++     */
++    if (s->s_type != STYPE_STD ||
++        s->s_source_type != S_MPEG_TS ||
++        !s->s_channel_tags) {
++      blocked = 1;
++      continue;
++    }
++
++    ms = (mpegts_service_t *)s;
++
++    if (!ms->s_dvb_mux ||
++        !idnode_is_instance(&ms->s_dvb_mux->mm_id,
++                            &iptv_mux_class)) {
++      blocked = 1;
++      continue;
++    }
++
++    if (ms->s_dvb_mux == (mpegts_mux_t *)owner)
++      owner_service_seen = 1;
++
++    tags = s->s_channel_tags(s);
++
++    /*
++     * NULL may mean no groups, but can also mean failure to
++     * obtain them. Fail conservatively.
++     */
++    if (!tags) {
++      blocked = 1;
++      continue;
++    }
++
++    HTSMSG_FOREACH(field, tags) {
++      name = htsmsg_field_get_str(field);
++
++      if (!name || !*name) {
++        blocked = 1;
++        continue;
++      }
++
++      /*
++       * Lookup only. Never create a Channel Tag during evaluation.
++       */
++      if (channel_tag_find_by_name(name, 0) == ct)
++        required = 1;
++    }
++
++    htsmsg_destroy(tags);
++  }
++
++  if (!services_seen || !owner_service_seen || blocked)
++    return G3AW_TAG_DEPENDENCY_BLOCKED;
++
++  if (required)
++    return G3AW_TAG_DEPENDENCY_REQUIRED;
++
++  return G3AW_TAG_DEPENDENCY_OBSOLETE_CANDIDATE;
++}
++
++
++/*
++ * G3AW-R2C18: read-only lookup in the persisted ownership ledger.
++ *
++ * Return  1: requested association is recorded exactly once.
++ * Return  0: valid ledger, requested association not recorded.
++ * Return -1: invalid or ambiguous ledger.
++ *
++ * A positive lookup does NOT authorize unlinking.
++ */
++
++/*
++ * G3AW-R2C20: compare the complete channel:tag key.
++ * Record pointers refer to the validated, immutable ledger.
++ */
++static int
++g3aw_managed_link_key_cmp(const void *a, const void *b)
++{
++  const char *left = *(const char * const *)a;
++  const char *right = *(const char * const *)b;
++
++  return memcmp(left, right, 65);
++}
++
++static int __attribute__((unused))
++g3aw_managed_link_lookup(iptv_mux_t *im,
++                         channel_t *ch, channel_tag_t *ct)
++{
++  const char *ledger;
++  char channel_uuid[UUID_HEX_SIZE];
++  char tag_uuid[UUID_HEX_SIZE];
++  size_t len, pos, i, count;
++  const char **entries;
++  int matches = 0;
++
++  if (!im || !ch || !ct)
++    return -1;
++
++  ledger = im->mm_iptv_managed_tag_links;
++
++  if (!ledger || !*ledger)
++    return 0;
++
++  /*
++   * Bound the scan before inspecting records.
++   * All v1 entries are 66 bytes after the three-byte header.
++   */
++  len = strnlen(ledger, 1048577);
++
++  if (len > 1048576 || len < 3 ||
++      memcmp(ledger, "v1\n", 3) != 0 ||
++      (len - 3) % 66 != 0)
++    return -1;
++
++  idnode_uuid_as_str(&ch->ch_id, channel_uuid);
++  idnode_uuid_as_str(&ct->ct_id, tag_uuid);
++
++  for (pos = 3; pos < len; pos += 66) {
++    const char *p = ledger + pos;
++
++    for (i = 0; i < 32; i++) {
++      if (!((p[i] >= '0' && p[i] <= '9') ||
++            (p[i] >= 'a' && p[i] <= 'f')))
++        return -1;
++    }
++
++    if (p[32] != ':')
++      return -1;
++
++    for (i = 33; i < 65; i++) {
++      if (!((p[i] >= '0' && p[i] <= '9') ||
++            (p[i] >= 'a' && p[i] <= 'f')))
++        return -1;
++    }
++
++    if (p[65] != '\n')
++      return -1;
++
++    if (memcmp(p, channel_uuid, 32) == 0 &&
++        memcmp(p + 33, tag_uuid, 32) == 0) {
++      if (++matches > 1)
++        return -1;
++    }
++  }
++
++
++  /*
++   * Validate ALL entries for duplicates, including entries unrelated
++   * to the requested association. Never trust a partially ambiguous
++   * ownership ledger.
++   *
++   * Allocation failure must block the decision, not bypass validation.
++   */
++  count = (len - 3) / 66;
++
++  if (count > 1) {
++    entries = malloc(count * sizeof(*entries));
++    if (!entries)
++      return -1;
++
++    for (i = 0; i < count; i++)
++      entries[i] = ledger + 3 + i * 66;
++
++    qsort(entries, count, sizeof(*entries),
++          g3aw_managed_link_key_cmp);
++
++    for (i = 1; i < count; i++) {
++      if (memcmp(entries[i - 1], entries[i], 65) == 0) {
++        free(entries);
++        return -1;
++      }
++    }
++
++    free(entries);
++  }
++
++  return matches;
++}
++
++static void
++g3aw_map_existing_channel_tags(mpegts_mux_t *mm)
++{
++  mpegts_service_t *ms;
++  service_t *s;
++  idnode_list_mapping_t *ilm;
++  htsmsg_t *tags;
++  htsmsg_field_t *f;
++  channel_tag_t *ct;
++  channel_t *ch;
++  const char *name;
++
++  LIST_FOREACH(ms, &mm->mm_services, s_dvb_mux_link) {
++    s = (service_t *)ms;
++
++    if (!LIST_FIRST(&s->s_channels) || !s->s_channel_tags)
++      continue;
++
++    tags = s->s_channel_tags(s);
++    if (!tags)
++      continue;
++
++    HTSMSG_FOREACH(f, tags) {
++      name = htsmsg_field_get_str(f);
++      if (!name || !*name)
++        continue;
++
++      ct = channel_tag_find_by_name(name, 1);
++      if (!ct)
++        continue;
++
++      LIST_FOREACH(ilm, &s->s_channels, ilm_in1_link) {
++        ch = (channel_t *)ilm->ilm_in2;
++
++        if (channel_tag_map(ct, ch, ch)) {
++          int recorded;
++
++          /* Link has just been created; never adopt existing links. */
++          idnode_changed(&ch->ch_id);
++          recorded = g3aw_record_managed_tag_link(
++            (iptv_mux_t *)mm, ch, ct);
++
++          if (recorded < 0)
++            tvhwarn(LS_IPTV,
++                    "G3AW-R2C5: channel/tag association "
++                    "created without ownership record");
++        }
++      }
++    }
++
++    htsmsg_destroy(tags);
++  }
++}
++
++/*
++ * G3AW-R2C26: remove obsolete, ledger-owned channel/tag links.
++ *
++ * Never adopt historical links. Never delete global Channel Tag
++ * objects. Ambiguous ownership or service dependencies block removal.
++ *
++ * Global lock is held by the HTTP playlist synchronizer.
++ */
++static int
++g3aw_no_other_ledger_owner(iptv_mux_t *owner,
++                           channel_t *ch, channel_tag_t *ct)
++{
++  mpegts_network_t *mn;
++  mpegts_mux_t *mm;
++  int state;
++
++  LIST_FOREACH(mn, &mpegts_network_all, mn_global_link) {
++    LIST_FOREACH(mm, &mn->mn_muxes, mm_network_link) {
++      if (mm == (mpegts_mux_t *)owner)
++        continue;
++
++      if (!idnode_is_instance(&mm->mm_id, &iptv_mux_class))
++        continue;
++
++      state = g3aw_managed_link_lookup((iptv_mux_t *)mm, ch, ct);
++
++      /*
++       * 1 = another owner, -1 = corrupt/unknown ledger.
++       * Both cases prohibit removing the association.
++       */
++      if (state != 0)
++        return 0;
++    }
++  }
++
++  return 1;
++}
++
++static void
++g3aw_reconcile_obsolete_owned_tags(mpegts_mux_t *mm)
++{
++  iptv_mux_t *im = (iptv_mux_t *)mm;
++  const char *ledger = im->mm_iptv_managed_tag_links;
++  char *snapshot;
++  size_t length, offset;
++
++  lock_assert(&global_lock);
++
++  if (!ledger || !*ledger)
++    return;
++
++  length = strnlen(ledger, 1048577);
++
++  if (length < 3 || length > 1048576 ||
++      memcmp(ledger, "v1\n", 3) ||
++      (length - 3) % 66)
++    return;
++
++  snapshot = strdup(ledger);
++  if (!snapshot)
++    return;
++
++  for (offset = 3; offset < length; offset += 66) {
++    const char *entry = snapshot + offset;
++    mpegts_service_t *ms;
++    idnode_list_mapping_t *service_link, *tag_link;
++    channel_t *ch;
++    channel_tag_t *ct;
++    char channel_uuid[UUID_HEX_SIZE];
++    char tag_uuid[UUID_HEX_SIZE];
++    int processed = 0;
++
++    /*
++     * Identify only objects linked to services of the owning mux.
++     * Never resolve by display name or create missing objects.
++     */
++    LIST_FOREACH(ms, &mm->mm_services, s_dvb_mux_link) {
++      LIST_FOREACH(service_link, &ms->s_channels, ilm_in1_link) {
++        ch = (channel_t *)service_link->ilm_in2;
++
++        if (!ch)
++          continue;
++
++        idnode_uuid_as_str(&ch->ch_id, channel_uuid);
++
++        if (memcmp(entry, channel_uuid, 32))
++          continue;
++
++        LIST_FOREACH(tag_link, &ch->ch_ctms, ilm_in2_link) {
++          ct = (channel_tag_t *)tag_link->ilm_in1;
++
++          if (!ct)
++            continue;
++
++          idnode_uuid_as_str(&ct->ct_id, tag_uuid);
++
++          if (entry[32] != ':' ||
++              memcmp(entry + 33, tag_uuid, 32) ||
++              entry[65] != '\n')
++            continue;
++
++          /*
++           * The complete owner ledger must validate, including
++           * duplicate records not related to this association.
++           */
++          if (g3aw_managed_link_lookup(im, ch, ct) != 1)
++            continue;
++
++          if (!g3aw_no_other_ledger_owner(im, ch, ct))
++            continue;
++
++          if (g3aw_evaluate_channel_tag_dependency(im, ch, ct) !=
++              G3AW_TAG_DEPENDENCY_OBSOLETE_CANDIDATE)
++            continue;
++
++          /*
++           * Allocate the updated ledger BEFORE unlinking.
++           * Allocation failure must not change channel relations.
++           */
++          {
++            const char *current = im->mm_iptv_managed_tag_links;
++            size_t current_len = strlen(current);
++            size_t pos;
++            char *updated = NULL;
++
++            for (pos = 3; pos + 66 <= current_len; pos += 66) {
++              if (memcmp(current + pos, entry, 66) == 0)
++                break;
++            }
++
++            if (pos + 66 > current_len)
++              continue;
++
++            updated = malloc(current_len - 66 + 1);
++
++            if (!updated)
++              continue;
++
++            memcpy(updated, current, pos);
++            memcpy(updated + pos, current + pos + 66,
++                   current_len - pos - 66);
++            updated[current_len - 66] = '\0';
++
++            if (channel_tag_unmap_exact(ct, ch)) {
++              im->mm_iptv_managed_tag_links = updated;
++              free((char *)current);
++              idnode_changed(&im->mm_id);
++
++              tvhinfo(LS_IPTV,
++                      "G3AW-R2C26: obsolete owned tag "
++                      "association removed");
++            } else {
++              free(updated);
++            }
++          }
++
++          processed = 1;
++          break;
++        }
++
++        if (processed)
++          break;
++      }
++
++      if (processed)
++        break;
++    }
++  }
++
++  free(snapshot);
++}
++
++
+ static int
+ g3an_valid_cuid(const char *s)
+ {
+@@ -234,7 +803,7 @@ iptv_auto_network_process_m3u_item(iptv_network_t *in,
+   mpegts_mux_t *mm;
+   iptv_mux_t *im;
+   url_t u, u2;
+-  int change, epgcfg, muxprio, smuxprio, name_changed, can_notify;
++  int change, epgcfg, muxprio, smuxprio, name_changed, can_notify, tags_changed;
+   iptv_auto_channel_snapshot_t *name_snapshots = NULL;
+   size_t name_snapshots_count = 0;
+   size_t k;
+@@ -409,6 +978,7 @@ skip_url:
+       }
+       im->im_delete_flag = 0;
+       change = 0;
++      tags_changed = 0;
+       name_changed = strcmp(im->mm_iptv_svcname ?: "", name) != 0;
+       /* The HTTP download callback holds global_lock; file/pipe not audited. */
+       can_notify = name_changed &&
+@@ -451,6 +1021,7 @@ skip_url:
+       if (strcmp(im->mm_iptv_tags ?: "", tags ?: "")) {
+         free(im->mm_iptv_tags);
+         im->mm_iptv_tags = tags ? strdup(tags) : NULL;
++        tags_changed = 1;
+         change = 1;
+       }
+       if (epgcfg >= 0 && im->mm_epg != epgcfg) {
+@@ -472,6 +1043,14 @@ skip_url:
+       }
+       if (change)
+         idnode_notify_changed(&im->mm_id);
++
++      if (tags_changed &&
++          (!strncmp(in->in_url ?: "", "http://", 7) ||
++           !strncmp(in->in_url ?: "", "https://", 8))) {
++        g3aw_map_existing_channel_tags(mm);
++        g3aw_reconcile_obsolete_owned_tags(mm);
++      }
++
+       if (can_notify) {
+         for (k = 0; k < name_snapshots_count; k++) {
+           channel_t *ch = name_snapshots[k].channel;
+diff --git a/src/input/mpegts/iptv/iptv_mux.c b/src/input/mpegts/iptv/iptv_mux.c
+index 32821c6..42df7a4 100644
+--- a/src/input/mpegts/iptv/iptv_mux.c
++++ b/src/input/mpegts/iptv/iptv_mux.c
+@@ -274,6 +274,14 @@ const idclass_t iptv_mux_class =
+       .off      = offsetof(iptv_mux_t, mm_iptv_tags),
+       .opts     = PO_ADVANCED | PO_MULTILINE
+     },
++
++    {
++      .type     = PT_STR,
++      .id       = "iptv_managed_tag_links",
++      .name     = N_("IPTV managed channel-tag links"),
++      .off      = offsetof(iptv_mux_t, mm_iptv_managed_tag_links),
++      .opts     = PO_HIDDEN | PO_NOUI | PO_MULTILINE
++    },
+     {
+       .type     = PT_U32,
+       .id       = "iptv_satip_dvbt_freq",
+@@ -349,6 +357,7 @@ iptv_mux_free ( mpegts_mux_t *mm )
+   free(im->mm_iptv_env);
+   free(im->mm_iptv_hdr);
+   free(im->mm_iptv_tags);
++  free(im->mm_iptv_managed_tag_links);
+   free(im->mm_iptv_icon);
+   free(im->mm_iptv_epgid);
+   mpegts_mux_free(mm);
+diff --git a/src/input/mpegts/iptv/iptv_private.h b/src/input/mpegts/iptv/iptv_private.h
+index 1c86c09..e89f414 100644
+--- a/src/input/mpegts/iptv/iptv_private.h
++++ b/src/input/mpegts/iptv/iptv_private.h
+@@ -168,6 +168,12 @@ struct iptv_mux
+   char                 *mm_iptv_env;
+   char                 *mm_iptv_hdr;
+   char                 *mm_iptv_tags;
++  /*
++   * G3AW-R2C: persisted ownership ledger for IPTV-managed
++   * channel/tag associations. No entries are adopted from
++   * pre-existing mappings.
++   */
++  char                 *mm_iptv_managed_tag_links;
+   uint32_t              mm_iptv_satip_dvbt_freq;
+   uint32_t              mm_iptv_satip_dvbc_freq;
+   uint32_t              mm_iptv_satip_dvbs_freq;
+diff --git a/src/input/mpegts/iptv/iptv_service.c b/src/input/mpegts/iptv/iptv_service.c
+index 2292ca1..fdc11d9 100644
+--- a/src/input/mpegts/iptv/iptv_service.c
++++ b/src/input/mpegts/iptv/iptv_service.c
+@@ -111,19 +111,34 @@ iptv_service_channel_tags ( service_t *s )
+ {
+   iptv_service_t   *is = (iptv_service_t *)s;
+   iptv_mux_t       *im = (iptv_mux_t *)is->s_dvb_mux;
+-  char             *p = im->mm_iptv_tags, *x;
++  char             *copy, *p, *x;
+   htsmsg_t         *r = NULL;
+-  if (p) {
+-    r = htsmsg_create_list();
+-    while (*p) {
+-      while (*p && *p <= ' ') p++;
+-      x = p;
+-      while (*p && *p >= ' ') p++;
+-      if (*p) { *p = '\0'; p++; }
+-      if (*x)
+-        htsmsg_add_str(r, NULL, x);
+-    }
++
++  if (!im->mm_iptv_tags)
++    return NULL;
++
++  /* G3AW-R1: tokenize a private copy, never mutate mux metadata. */
++  copy = strdup(im->mm_iptv_tags);
++  if (!copy)
++    return NULL;
++
++  r = htsmsg_create_list();
++  if (!r) {
++    free(copy);
++    return NULL;
+   }
++
++  p = copy;
++  while (*p) {
++    while (*p && (unsigned char)*p <= ' ') p++;
++    x = p;
++    while (*p && (unsigned char)*p >= ' ') p++;
++    if (*p) { *p = '\0'; p++; }
++    if (*x)
++      htsmsg_add_str(r, NULL, x);
++  }
++
++  free(copy);
+   return r;
+ }
+ 
