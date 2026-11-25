@@ -1,0 +1,44 @@
+--- a/src/epggrab/module/xmltv.c
++++ b/src/epggrab/module/xmltv.c
+@@ -50,6 +50,7 @@
+ #include "epggrab.h"
+ #include "epggrab/private.h"
+ 
++#include <strings.h>
+ #define XMLTV_FIND "tv_find_grabbers"
+ #define XMLTV_GRAB "tv_grab_"
+ 
+@@ -625,6 +626,33 @@
+   uint8_t cat_val;
+   int cat_flag = 0;
+   const char *cat_etsi;
++
++  /*
++   * G3AZ-P91: Preserve television series as textual categories.
++   * An empty genre list clears previous incorrect DVB genres.
++   */
++  HTSMSG_FOREACH(f, tags) {
++    if (!strcmp(htsmsg_field_name(f), "category") &&
++        (e = htsmsg_get_map_by_field(f))) {
++      const char *name = htsmsg_get_str(e, "cdata");
++
++      if (name) {
++        const char *end;
++
++        while (*name == ' ' || *name == '\t')
++          name++;
++
++        end = name + strlen(name);
++        while (end > name &&
++               (end[-1] == ' ' || end[-1] == '\t'))
++          end--;
++
++        if ((end - name) == 6 &&
++            !strncasecmp(name, "Series", 6))
++          return calloc(1, sizeof(epg_genre_list_t));
++      }
++    }
++  }
+ 
+   HTSMSG_FOREACH(f, tags) {
+     if (!strcmp(htsmsg_field_name(f), "category") && (e = htsmsg_get_map_by_field(f))) {
